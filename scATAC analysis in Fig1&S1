@@ -1,0 +1,206 @@
+library(Seurat)
+library(Signac)
+library(ggplot2)
+library(dplyr)
+library(cowplot) 
+library(patchwork)
+library(tidyr)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+
+#Step1. Read
+atac <- readRDS("harmony.rds")
+
+# Step2. Anotation
+seob_norm <- readRDS("sc_WT_annotated.rds")
+DefaultAssay(seob_norm) <- "RNA"
+seob_norm <- FindVariableFeatures(seob_norm, nfeatures = 6000)
+DefaultAssay(atac) <- "RNA"
+transfer_anchors <- FindTransferAnchors(
+  reference = seob_norm,
+  query = atac,
+  reduction = "cca", 
+  dims = 1:30
+)
+celltype_predictions <- TransferData(
+  anchorset = transfer_anchors,
+  refdata = seob_norm$celltype,
+  weight.reduction = atac[["lsi"]],
+  dims = 2:30
+)
+atac <- AddMetaData(atac, metadata = celltype_predictions)
+
+#filter low-quality cells
+atac <- subset(
+  atac,
+  subset = prediction.score.max > 0.35 & 
+    seurat_clusters != "34"
+)
+
+#Correcting cell types (based on marker gene activity)
+atac$celltype <- case_when(
+  atac$seurat_clusters %in% c("3","5","6","7","18","25","26","22") ~ "FB",
+  atac$seurat_clusters %in% c("0","1","2","4","8") ~ "KC",
+  atac$seurat_clusters %in% c("10") ~ "SMC",
+  atac$seurat_clusters %in% c("9","15") ~ "VEC",
+  atac$seurat_clusters %in% c("31") ~ "LEC",
+  atac$seurat_clusters %in% c("20","27") ~ "T",
+  atac$seurat_clusters %in% c("13","14","17") ~ "Mac",
+  atac$seurat_clusters %in% c("28") ~ "SGC",
+  atac$seurat_clusters %in% c("11","12","16","19","21","23","24","30","33","32") ~ "HF",
+  atac$seurat_clusters %in% c("29") ~ "Sch",
+  TRUE ~ "Unknown"
+)
+
+#final cell type
+p1 <- DimPlot(atac, group.by = "celltype", pt.size = 0.1, label = TRUE, repel = TRUE) 
+
+#Prediction score heatmap
+score_cols <- grep("^prediction\\.score\\.", colnames(atac@meta.data), value = TRUE)
+score_cols <- score_cols[score_cols != "prediction.score.max"]
+score_matrix <- as.matrix(atac@meta.data[, score_cols])
+colnames(score_matrix) <- gsub("prediction\\.score\\.", "", colnames(score_matrix))
+avg_scores <- aggregate(score_matrix, 
+                        by = list(CellType = atac$celltype), 
+                        FUN = mean)
+rownames(avg_scores) <- avg_scores$CellType
+avg_scores <- avg_scores[, -1]
+desired_row_order <- c("Mac", "LEC", "T", "FB", "HF", "Sch", "SMC", "SGC", "VEC", "KC")
+desired_col_order <- c("Mac", "LEC", "T", "FB", "HF", "Sch", "SMC", "SGC", "VEC", "Pro", "Gra","Spin","Bas","Mast")
+avg_scores_ordered <- avg_scores[desired_row_order, desired_col_order, drop = FALSE]
+p2 <- pheatmap(avg_scores_ordered,
+         color = colorRampPalette(c("white", "skyblue", "darkblue"))(100),
+         main = "scATAC vs scRNA Cell Type Correlation",
+         cluster_rows = F,
+         cluster_cols = F,
+         angle_col = 45,
+         fontsize_row = 10,
+         fontsize_col = 10,
+         border = NA,
+         display_numbers = F,
+         show_colnames = T,
+         show_rownames = T)
+
+#Step3. UMAP of Col1a2
+DefaultAssay(atac) <- "RNA"
+p3 <- FeaturePlot(atac,
+            features = "Col1a2",
+            cols = c("lightgrey", "red"),
+            pt.size = 0.001)
+
+#Step4. Number of peaks in ScarD45 group
+scarD45_data <- atac@meta.data %>%
+  filter(group == "ScarD45")
+p4 <- ggplot(scarD45_data, aes(x = celltype, y = nFeature_peaks, fill = celltype)) +
+  geom_boxplot(width = 0.6, alpha = 0.8, outlier.shape = NA, coef = 1.5, color = "black", lwd = 0.5, fatten = 1.2) +
+  geom_jitter(width = 0.2, height = 0, size = 1.0, alpha = 0.8, color = "black", shape = 16) +
+  scale_fill_viridis_d(option = "plasma",alpha = 0.7,begin = 0.5,end = 1.0) +
+  labs(title = "ScarD45 Group: Peak Count Distribution",
+    x = "Cell Type",
+    y = "Number of Peaks") 
+
+#Step5. Differential analysis of FB subpopulations
+FB_sub <- subset(atac, subset = celltype == "FB")
+DefaultAssay(FB_sub) <- "RNA"
+Idents(FB_sub) <- FB_sub$group
+comparisons <- list(
+  "ScarD14vsSkin" = list(experimental = "ScarD14", control = "Skin"),
+  "ScarD25vsSkin" = list(experimental = "ScarD25", control = "Skin"),
+  "ScarD45vsSkin" = list(experimental = "ScarD45", control = "Skin")
+)
+results <- list()
+for (comp_name in names(comparisons)) {
+  groups <- comparisons[[comp_name]]
+  da_peaks <- FindMarkers(
+    object = FB_sub,
+    ident.1 = groups[1],
+    ident.2 = groups[2],
+    test.use = 'LR',
+    min.pct = 0.1
+  )
+  da_peaks$comparison <- comp_name
+  da_peaks$peak <- rownames(da_peaks)
+  da_peaks$direction <- ifelse(da_peaks$avg_log2FC > 0, "up", "down")
+  da_peaks_sig <- subset(da_peaks, p_val < 0.05 & abs(avg_log2FC) > 0.3)
+  results[[comp_name]] <- da_peaks_sig
+}
+all_results <- do.call(rbind, results)
+
+up_peak_sets <- lapply(results, function(df) {
+  subset(df, p_val_adj < 0.05 & avg_log2FC > 0.5)$peak
+})
+common_up_peaks <- Reduce(intersect, up_peak_sets)
+
+#Step6. GO enrichment of common_up
+genes <- common_up_peaks
+gene_ids <- bitr(genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = "org.Mm.eg.db")
+go_enrich <- enrichGO(gene = gene_ids$ENTREZID,
+                      OrgDb = org.Mm.eg.db,
+                      ont = "ALL", 
+                      pAdjustMethod = "BH",
+                      pvalueCutoff = 0.05,
+                      qvalueCutoff = 0.05,
+                      readable = TRUE)
+go_result <- go_enrich@result
+go_result$GeneRatio_num <- sapply(go_result$GeneRatio, function(x) {
+  num_den <- as.numeric(strsplit(x, "/")[[1]])
+  num_den[1] / num_den[2]
+})
+go_result <- go_result[order(-go_result$GeneRatio_num), ]
+p6 <- ggplot(go_result[1:min(10, nrow(go_result)), ], 
+            aes(x = GeneRatio_num, 
+                y = reorder(Description, GeneRatio_num),
+                size = Count,
+                color = -log10(qvalue))) +
+  geom_point(alpha = 1) +
+  scale_color_gradient(low = "#F0E68C", high = "#FF6347", 
+                       name = "-log10(qvalue)") +
+  scale_size_continuous(range = c(2, 6), 
+                        name = "Gene Count") +
+  labs(x = "Gene Ratio", 
+       y = "GO Term Description",
+       title = "GO Enrichment Analysis of Common Up-regulated Genes") +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.text.y = element_text(size = 10),
+    axis.text.x = element_text(size = 10),
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 10),
+    legend.position = "right",
+    panel.grid.major = element_line(color = "grey90", linewidth = 0.2),
+    panel.grid.minor = element_blank())
+
+#Step7. Dot plot of ion channel genes
+p7 <- DotPlot(
+  FB_sub,
+  assay = "RNA",
+  features = c("Gria1","Kcnh8","Gabrb3","Kcnj6","Kcnh1","Piezo2","Pex5l","Abcc8","Slc24a4","Gpr39","Grm1","Atp13a5","Jph2","Lyn"),
+  group.by = "group",
+  cols = c("lightyellow","firebrick3"),
+) +
+  theme_classic()
+
+#Step8. Coverage plot of Piezo2 and Piezo1
+DefaultAssay(FB_sub) <- "peaks"
+
+gene_coords <- LookupGeneCoords(object = FB_sub, gene = "Piezo2", assay = "peaks")
+regions <- subsetByOverlaps(StringToGRanges(rownames(FB_sub)), gene_coords)
+p8 <- CoveragePlot(
+  object = FB_sub,
+  region = regions,
+  extend.upstream = 2000,
+  extend.downstream = 2000,
+  group.by = "group",
+  heights = c(20, 1)
+)
+
+gene_coords2 <- LookupGeneCoords(object = FB_sub, gene = "Piezo1", assay = "peaks")
+regions2 <- subsetByOverlaps(StringToGRanges(rownames(FB_sub)), gene_coords2)
+p9 <- CoveragePlot(
+  object = FB_sub,
+  region = regions2,
+  extend.upstream = 2000,
+  extend.downstream = 2000,
+  group.by = "group",
+  heights = c(20, 1)
+)
