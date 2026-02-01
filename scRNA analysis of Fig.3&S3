@@ -1,0 +1,411 @@
+library(Seurat)
+library(ggplot2)
+library(clustree)
+library(dplyr)
+library(patchwork)
+library(DoubletFinder)
+
+# Step1 Read data
+CKO.list <- Read10X(data.dir = "P2_CKO")
+WT.list <- Read10X(data.dir = "P2_flfl")
+CKO.data <- CreateSeuratObject(counts = CKO.list, project = "CKO", min.cells = 10, min.features = 500)
+WT.data <- CreateSeuratObject(counts = WT.list, project = "WT", min.cells = 10, min.features = 500)
+
+# Step2 Quality control
+CKO.data[["percent.mt"]] <- PercentageFeatureSet(CKO.data, pattern = "^mt-")
+CKO.data[["percent.hb"]] <- PercentageFeatureSet(CKO.data, pattern = "^Hb[ab]")
+CKO.data[["percent.rb"]] <- PercentageFeatureSet(CKO.data, pattern = "^Rps|^Rpl")
+WT.data[["percent.mt"]] <- PercentageFeatureSet(WT.data, pattern = "^mt-")
+WT.data[["percent.hb"]] <- PercentageFeatureSet(WT.data, pattern = "^Hb[ab]")
+WT.data[["percent.rb"]] <- PercentageFeatureSet(WT.data, pattern = "^Rps|^Rpl")
+CKO.filtered <- subset(CKO.data,
+                       subset = nFeature_RNA > 300 & 
+                         nFeature_RNA < 7500 &
+                         nCount_RNA < 60000 &
+                         percent.mt < 10 &
+                         percent.hb < 1)
+WT.filtered <- subset(WT.data,
+                      subset = nFeature_RNA > 300 & 
+                        nFeature_RNA < 7500 &
+                        nCount_RNA < 60000 &
+                        percent.mt < 10 &
+                        percent.hb < 1)
+
+CKO.seurat <- NormalizeData(CKO.filtered)
+CKO.seurat <- FindVariableFeatures(CKO.seurat, selection.method = "vst", nfeatures = 2000)
+CKO.seurat <- ScaleData(CKO.seurat, vars.to.regress = c("percent.mt"))
+CKO.seurat <- RunPCA(CKO.seurat, verbose = FALSE)
+
+WT.seurat <- NormalizeData(WT.filtered)
+WT.seurat <- FindVariableFeatures(WT.seurat, selection.method = "vst", nfeatures = 2000)
+WT.seurat <- ScaleData(WT.seurat, vars.to.regress = c("percent.mt"))
+WT.seurat <- RunPCA(WT.seurat, verbose = FALSE)
+
+#DoubletFinder
+doublet_rate <- 0.03
+nExp <- round(doublet_rate * ncol(CKO.seurat))
+nExp2 <- round(doublet_rate * ncol(WT.seurat))
+CKO.seurat <- doubletFinder(CKO.seurat, PCs = 1:20, pN = 0.25, pK = 0.2, nExp = nExp)
+WT.seurat <- doubletFinder(WT.seurat, PCs = 1:20, pN = 0.25, pK = 0.1, nExp = nExp2)
+doublet_col_cko <- grep("^DF\\.classifications", names(CKO.seurat@meta.data), value = TRUE)
+doublet_col_wt <- grep("^DF\\.classifications", names(WT.seurat@meta.data), value = TRUE)
+CKO.singlets <- subset(CKO.seurat, 
+                       cells = colnames(CKO.seurat)[CKO.seurat@meta.data[[doublet_col_cko]] == "Singlet"])
+WT.singlets <- subset(WT.seurat, 
+                      cells = colnames(WT.seurat)[WT.seurat@meta.data[[doublet_col_wt]] == "Singlet"])
+
+# Step4 Integration and batch-effect correction
+merged.seurat <- merge(CKO.singlets, y = WT.singlets, add.cell.ids = c("CKO", "WT"), project = "PIEZO2")
+merged.seurat <- NormalizeData(merged.seurat) %>%
+  FindVariableFeatures(nfeatures= 4000 ) %>%
+  ScaleData() %>%
+  RunPCA(npcs = 50)
+merged <- IntegrateLayers(object = merged.seurat, 
+                           method = CCAIntegration, 
+                           orig.reduction = "pca", 
+                           new.reduction = "integrated.cca",verbose = FALSE)
+merged[["RNA"]] <- JoinLayers(merged[["RNA"]])
+
+# Step5 Dimensionality reduction and clustering
+dims <- 1:32 
+merged <- RunUMAP(merged, reduction = "integrated.cca", dims = dims, reduction.name = "umap")
+merged <- FindNeighbors(merged, reduction = "integrated.cca", dims = dims)
+merged <- FindClusters(merged, resolution = seq(0.1, 1, 0.1))
+merged$seurat_clusters <- merged@meta.data[[paste0("RNA_snn_res.", 0.9)]]
+
+# Step6 Annotation
+Idents(merged) <- "seurat_clusters" 
+celltype_markers <- c("Krt1", "Krt10","Calm4", "Krt5", "Krt14", "Sox9","Krt15", "Lgr5", "Lhx2",
+                       "Lum", "Dcn", "Col1a2", "Col1a1","Col3a1",
+                       "Lyz2", "Mrc1", "C1qa", "C1qb", "C1qc","Ctss",
+                       "H2-Eb1","Cd74","H2-Ab1","H2-Aa",
+                       "Cd207", "Ltc4s",
+                       "Hdc", "Srgn",
+                       "Rbfox1", "Ndnf", "Dcc", 
+                       "Pecam1", "Kdr","Cdh5","Cldn5", 
+                       "Mmrn1","Prox1",
+                       "Myh11", "Acta2", "Myl9", "Tagln", 
+                       "Trbc1", "Trbc2", "Cxcr6", "Cd3e","Cd3g", "Cd3d", 
+                       "Prf1", "Cd7","Klrd1","Ptprcap","Xcl1",
+                       "Akr1c18", "Pparg", "Acoxl", 
+                       "Dct", "Tyr", "Tyrp1","Kit","Ptgds","Pax3","Syngr1", 
+                       "Mbp", "Kcna1", "Mpz", "Gatm", "Plp1")
+p1 <- DotPlot(merged, features = unique(unlist(celltype_markers2)), group.by = "cell_type", cols = c("white", "red"), col.min = 0) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+cluster_annotations <- c(
+  "1" = "Keratinocytes", "2" = "Keratinocytes",  "3" = "Keratinocytes",  "6" = "Keratinocytes",  "8" = "Keratinocytes",  "12" = "Keratinocytes",  "13" = "Keratinocytes",  "14" = "Keratinocytes",  "27" = "Keratinocytes", 
+  "4" = "Hair follicle cells", "5" = "Hair follicle cells", "11" = "Hair follicle cells",
+  "0" = "Fibroblasts", "23" = "Fibroblasts", "10" = "Fibroblasts", "26" = "Fibroblasts",
+  "7" = "Macrophage", "15" = "Macrophage",
+  "16" = "Dendritic cells", 
+  "29" = "Mast cells",
+  "20" = "Neuron", 
+  "18" = "Endothelial cells",
+  "17" = "Smooth muscle cells", "30" = "Smooth muscle cells",
+  "9" = "T cells", "19" = "T cells",
+  "28" = "NK cells",
+  "21" = "Sebocytes",
+  "22" = "Melanocytes", "24" = "Melanocytes",
+  "25" = "Schwann cells"
+)
+merged$cell_type <- factor(
+  plyr::mapvalues(
+    merged$seurat_clusters,
+    from = names(cluster_annotations),
+    to = cluster_annotations
+  ),
+  levels = unique(cluster_annotations)
+)
+p2 <- DimPlot(merged, reduction = "umap", group.by = "cell_type", label = TRUE, repel = TRUE, label.size = 4) +
+  ggtitle("Annotated Cell Types") +
+  theme(legend.position = "right")
+
+#Step7 Piezo2 positive cell percentage
+P2exp_data <- GetAssayData(merged, assay = "RNA", layer = "data")["Piezo2", ]
+merged$Piezo2_binary <- ifelse(P2exp_data > 0, "Expressed", "Not expressed")
+merged$Piezo2_binary <- factor(merged$Piezo2_binary, 
+                                       levels = c("Not expressed", "Expressed"))
+p3 <- DimPlot(object = merged, reduction = "umap", group.by = "Piezo2_binary", split.by = "orig.ident", cols = c("Expressed" = "red", "Not expressed" = "lightgrey"), pt.size = 0.0001, order = TRUE) + 
+  plot_layout(guides = "collect") &
+  theme(legend.position = "right")
+
+expr_summary <- merged@meta.data %>%
+  group_by(orig.ident, cell_type, Piezo2_binary) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  tidyr::pivot_wider(
+    names_from = Piezo2_binary,
+    values_from = n,
+    values_fill = 0
+  ) %>%
+  mutate(
+    Total = `Expressed` + `Not expressed`, 
+    Proportion_in_type = Expressed / Total
+  )
+expr_summary <- expr_summary %>%
+  mutate(Group_total = ifelse(orig.ident == "CKO", 7720, 8591), #（CKO=7720，WT=8591）
+         Proportion_in_group = Expressed / Group_total)
+
+p4 <- ggplot(expr_summary, aes(x = cell_type, y = Proportion_in_group, fill = orig.ident)) + 
+  geom_bar(stat = "identity", position = position_dodge()) +
+  scale_fill_manual(values = c("CKO" = "#B22222", "WT" = "grey")) +
+  labs(
+    title = "Piezo2+ cells as fraction of all cells in CKO or WT",
+    x = "Cell Type",
+    y = "Proportion of Piezo2+ (per group total)",
+    fill = "Group"
+  ) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Step7 celltype percentage analysis
+library(forcats) 
+metadata <- merged@meta.data
+prop_data <- merged@meta.data %>%
+  count(orig.ident, cell_type) %>%
+  group_by(orig.ident) %>%
+  mutate(prop = n / sum(n) * 100) %>%
+  ungroup() %>%
+  mutate(cell_type = fct_reorder(cell_type, prop, .fun = sum, .desc = TRUE))  
+
+p5 <- ggplot(prop_data, aes(x = prop, y = cell_type, fill = orig.ident)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+  scale_fill_brewer(palette = "Set1") +
+  scale_x_continuous(expand = c(0, 0), limits = c(0, max(prop_data$prop) * 1.05)) + 
+  labs(x = "Percentage",
+       y = "Cell Type",
+       fill = "Sample") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        plot.title = element_text(hjust = 0.5, face = "bold"))
+
+# Step8 Differentially expressed genes (CKO vs WT)
+DefaultAssay(merged) <- "RNA"
+celltypes <- unique(merged$cell_type)
+DEG_counts <- data.frame()
+all_de_results <- list()
+for (celltype in celltypes) {
+  subset_obj <- subset(merged, cell_type == celltype) 
+  if (ncol(subset_obj) < 20) {
+    message("Skipping ", celltype, " - insufficient cells (n = ", ncol(subset_obj), ")")
+    next
+  }
+  deg <- FindMarkers(object = subset_obj, group.by = "orig.ident", ident.1 = "CKO", ident.2 = "WT", logfc.threshold = 0.3, min.pct = 0.2, test.use = "wilcox")
+  deg$gene <- rownames(deg)
+  deg$cell_type <- celltype
+  all_de_results[[celltype]] <- deg
+  sig_deg <- deg[deg$p_val_adj < 0.05 & abs(deg$avg_log2FC) > 0.3, ]
+  up_count <- sum(sig_deg$avg_log2FC > 0, na.rm = TRUE)
+  down_count <- sum(sig_deg$avg_log2FC < 0, na.rm = TRUE)
+  total_count <- nrow(sig_deg)
+  DEG_counts <- rbind(DEG_counts,
+                      data.frame(cell_type = celltype, 
+                                 up_regulated = up_count,
+                                 down_regulated = down_count,
+                                 total_DEG = total_count))
+}
+celltype_order <- DEG_counts %>% 
+    group_by(cell_type) %>%
+    arrange(total_DEG) %>%
+    pull(cell_type)
+DEG_counts$cell_type <- factor(DEG_counts$cell_type, levels = celltype_order)
+combined_de <- do.call(rbind, all_de_results)
+
+p6 <- ggplot(DEG_counts, aes(x = cell_type, y = total_DEG)) +
+  geom_bar(stat = "identity", fill = "#4DBBD5FF", width = 0.7) +
+  geom_text(aes(label = total_DEG), 
+            hjust = -0.2, size = 3.5) +
+  labs(title = "Total Differentially Expressed Genes by Cell Type",
+       x = "Cell Type",
+       y = "Number of DEGs") +
+  coord_flip() +
+  theme_minimal(base_size = 12))
+
+# Step8 GO enrichment analysis of fibroblasts
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(enrichplot)
+fibroblast_subset <- subset(merged, subset = cell_type == "Fibroblasts")
+fb_deg <- FindMarkers(object = fibroblast_subset, ident.1 = "CKO", ident.2 = "WT", logfc.threshold = 0.3, min.pct = 0.2, test.use = "wilcox")
+fb_deg$gene <- rownames(fb_deg)
+sig_fb_deg <- fb_deg[fb_deg$p_val_adj < 0.05 & abs(fb_deg$avg_log2FC) > 0.3, ]
+sig_fb_deg$direction <- ifelse(sig_fb_deg$avg_log2FC > 0, "Upregulated", "Downregulated")
+sig_genes <- sig_fb_deg$gene
+
+go_results_list <- list()
+for (dir in c("Upregulated", "Downregulated")) {
+  genes <- sig_fb_deg$gene[sig_fb_deg$direction == dir]
+  if (length(genes) > 0) {
+    gene_ids <- bitr(genes, 
+                     fromType = "SYMBOL", 
+                     toType = "ENTREZID", 
+                     OrgDb = org.Mm.eg.db)
+    if (nrow(gene_ids) > 0) {
+      go_enrich <- enrichGO(
+        gene = gene_ids$ENTREZID,
+        OrgDb = org.Mm.eg.db,
+        keyType = "ENTREZID",
+        ont = "ALL",
+        pAdjustMethod = "BH",
+        pvalueCutoff = 1,
+        qvalueCutoff = 1,
+        readable = TRUE
+      )
+      if (!is.null(go_enrich) && nrow(go_enrich) > 0) {
+        go_df <- as.data.frame(go_enrich)
+        go_df$Direction <- dir
+        go_results_list[[dir]] <- go_df
+      }
+    }
+  }
+}
+all_go_results <- do.call(rbind, go_results_list)
+sig_go <- all_go_results[all_go_results$p.adjust < 0.05, ]
+sig_go$Category <- factor(
+  c("BP", "MF", "CC")[match(sig_go$ONTOLOGY, c("BP", "MF", "CC"))],
+  levels = c("BP", "MF", "CC")
+)
+top_go <- sig_go %>%
+  group_by(Direction) %>% 
+  arrange(qvalue, .by_group = TRUE) %>%
+  slice_head(n = 5) %>% 
+  ungroup()
+top_go$GeneRatio <- sapply(top_go$GeneRatio, function(x) {
+  num_denom <- strsplit(x, "/")[[1]]
+  as.numeric(num_denom[1]) / as.numeric(num_denom[2])
+})
+top_go$TermLabel <- paste0(top_go$Description, " (", top_go$ONTOLOGY, ")")
+top_go <- top_go %>%
+  group_by(Direction) %>%
+  arrange(qvalue) %>%
+  mutate(TermLabel = factor(TermLabel, levels = unique(TermLabel))) %>%
+  ungroup()
+
+p7 <- ggplot(top_go, aes(x = p.adjust, y = reorder(TermLabel, -p.adjust), 
+                   fill = GeneRatio)) +
+  geom_col(width = 0.7) + 
+  scale_fill_gradient(low = "lightblue", high = "darkblue", 
+                      name = "Gene Ratio") + 
+  scale_x_continuous(trans = "log10") + 
+  facet_grid(Direction ~ ., scales = "free_y", space = "free_y") +
+  theme_bw(base_size = 12) +
+  labs(x = "p.adjust", 
+       y = "GO Term (Category)",
+       title = "Top 10 Enriched GO Terms"))
+
+# Step9 Analysis of fibroblast subpopulations
+library(harmony)
+fibroblast_subset <- NormalizeData(fibroblast_subset)
+fibroblast_subset <- FindVariableFeatures(fibroblast_subset, nfeatures = 2000)
+fibroblast_subset <- ScaleData(fibroblast_subset)
+fibroblast_subset <- RunPCA(fibroblast_subset, npcs = 20)
+ElbowPlot(fibroblast_subset, ndims = 20)
+fibroblast_subset <- RunHarmony(fibroblast_subset, group.by.vars = "orig.ident")
+fibroblast_subset <- JoinLayers(fibroblast_subset)
+fibroblast_subset <- RunUMAP(fibroblast_subset, reduction = "pca", dims = 1:5, reduction.name = "umap_fb")
+fibroblast_subset <- FindNeighbors(fibroblast_subset, reduction = "pca", dims = 1:5)
+fibroblast_subset <- FindClusters(fibroblast_subset, resolution = seq(0.1, 1, 0.1))
+fibroblast_subset <- FindClusters(fibroblast_subset, resolution = 0.2) 
+Idents(fibroblast_subset) <- "seurat_clusters" 
+fibroblast_subset$orig.ident <- factor(fibroblast_subset$orig.ident, levels = c("WT", "CKO"))
+
+p8 <- DimPlot(fibroblast_subset, reduction = "umap_fb", group.by = "seurat_clusters", split.by = "orig.ident", label = TRUE, repel = TRUE) +
+  ggtitle("Fibroblast Subclusters")
+
+#fibroblast subtype markers
+fibroblast_markers2 <- list(   "mesenchymal cell" = c("GPC3","POSTN","ADAM12"),
+  "mesenchymal progenitor cell" = c("ISLR","Ly6a","CD34","CD52"),
+  "inflammatory" = c("CCL8","CD74"),  
+  "myofibroblasts" = c("ACTA2", "LRRC15", "COL11A1","TAGLN","COL11A1"),
+  "proliferating" = c("HMGB2","STMN1","H1f4","PCLAF"),
+  "papillary" = c("APCDD1","SPARC","LUM","DCN"))
+fibroblast_subset$fibro_subtype <- factor(
+  fibroblast_subset$fibro_subtype,
+  levels = c("mesenchymal", "myofibroblast", "proliferating", "papillary")
+)
+
+p9 <- DotPlot(fibroblast_subset, features = unique(unlist(fibroblast_markers2)), group.by = "fibro_subtype", scale = T, col.min = 0, cols = c("white", "darkblue")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggtitle("Marker Gene Expression by cluster")
+
+# fibroblast subtype annotation
+new.cluster.ids <- c(
+  "2" = "papillary",
+  "1" = "proliferating",
+  "4" = "mesenchymal-2",
+  "0" = "mesenchymal-1",
+  "3" = "mesenchymal-1",
+  "5" = "myofibroblast")
+fibroblast_subset$fibro_subtype <- plyr::mapvalues(
+  fibroblast_subset$seurat_clusters,
+  from = names(new.cluster.ids),
+  to = new.cluster.ids) 
+
+p10 <- DimPlot(fibroblast_subset, reduction = "umap_fb", group.by = "fibro_subtype", split.by = "orig.ident", label = F, cols = c("#1F77B4", "#FF7F0E", "#2CA02C", "#D62728","purple"))
+
+#Pie plot of proportion of fibroblast subtypes 
+cluster_prop <- fibroblast_subset@meta.data %>%
+  group_by(orig.ident, fibro_subtype) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(orig.ident) %>%
+  mutate(percent = count / sum(count) * 100,
+         label = sprintf("%.1f%%", percent))
+
+p11 <- ggplot(cluster_prop, aes(x = "", y = percent, fill = fibro_subtype)) +
+  geom_bar(stat = "identity", width = 1, color = "white") +
+  coord_polar("y", start = 0) +
+  facet_wrap(~ orig.ident) +
+  geom_text(aes(label = label), 
+            position = position_stack(vjust = 0.5),
+            size = 3) +
+  labs(fill = "Clusters", 
+       title = "Proportion of Fibroblast Subclusters by Sample") +
+  theme_void() +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        strip.text = element_text(size = 12, face = "bold")) +
+  scale_fill_brewer(palette = "Set3") 
+
+#Profibrotic gene set score
+library(msigdbr)
+library(AUCell)
+library(ggpubr)
+go0062023 <- msigdbr(
+  species = "Mus musculus",  
+  category = "C5",
+  subcategory = "GO:CC"
+) %>%
+  filter(gs_id == "GO:0062023") %>%
+  pull(gene_symbol) %>%
+  unique()
+GO0062023_genesets <- list(GOCC_COLLAGEN_CONTAINING_EXTRACELLULAR_MATRIX = go0062023)
+
+go0030199 <- msigdbr(
+  species = "Mus musculus",
+  category = "C5",
+  subcategory = "GO:BP"
+) %>%
+  filter(gs_id == "GO:0030199") %>%
+  pull(gene_symbol) %>%
+  unique()
+GO0030199_genesets <- list(GOBP_COLLAGEN_FIBRIL_ORGANIZATION = go0030199)
+
+expr_matrix <- GetAssayData(fibroblast_subset, slot = "data")  
+expr_matrix <- as.matrix(expr_matrix)
+cells_rankings <- AUCell_buildRankings(expr_matrix, nCores = 1, plotStats = FALSE)
+cells_AUC <- AUCell_calcAUC(GO0062023_genesets, cells_rankings, aucMaxRank = ceiling(0.05 * nrow(cells_rankings)))
+auc_scores <- as.data.frame(t(getAUC(cells_AUC)))
+rownames(auc_scores) <- colnames(fibroblast_subset)
+fibroblast_subset <- AddMetaData(fibroblast_subset, auc_scores)
+fibroblast_subset$ProFibrosis_Score <- rowMeans(auc_scores)
+
+p12 <- VlnPlot(fibroblast_subset, 
+        features = "ProFibrosis_Score", 
+        group.by = "orig.ident",
+        pt.size = 0, 
+        cols = c("#87CEEB", "#FFB6C1")) +
+  ggtitle("GOCC_COLLAGEN_CONTAINING_EXTRACELLULAR_MATRIX") +
+  ggpubr::stat_compare_means(method = "t.test", label = "p.format") +
+  geom_jitter(shape = 21, size = 3, stroke = 0.5, color = "black", alpha = 0.6, position = position_jitterdodge(jitter.width = 1, dodge.width = 0.9)) +
+  geom_boxplot(width = 0.3, fill = "white", alpha = 0.7, outlier.shape = NA, position = position_dodge(0.9)) +
+  theme(legend.position = "right")
